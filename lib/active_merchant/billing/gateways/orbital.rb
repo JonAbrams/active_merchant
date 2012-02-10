@@ -94,10 +94,11 @@ module ActiveMerchant #:nodoc:
       end
       
       # AC – Authorization and Capture
-      def purchase(money, creditcard, options = {})
+      def purchase(money, creditcard_or_billing_id, options = {})
         order = build_new_order_xml('AC', money, options) do |xml|
-          add_creditcard(xml, creditcard, options[:currency])
-          add_address(xml, creditcard, options)   
+          add_payment_source(xml, creditcard_or_billing_id, options[:currency])
+          add_address(xml, creditcard_or_billing_id, options)
+          assign_customer_ref_num(xml, options[:billing_id]) if options[:billing_id]
         end
         commit(order)
       end                       
@@ -125,15 +126,104 @@ module ActiveMerchant #:nodoc:
         order = build_void_request_xml(authorization, options)
         commit(order)
       end
-    
+      
+      # NEW
+      def store(creditcard, options = {})   
+        parameters = {
+          :verify => options[:verify] || 'y', # USED?
+          :customer_ref_num => options[:billingid] || options[:billing_id] || nil,
+        }
+        
+        # TODO Build order xml
+        order = build_profile_request_xml(parameters) do |xml|
+          xml.tag! :CustomerProfileAction, 'C'
+          add_customer_data(xml, options)
+          xml.tag! :CustomerAccountType, 'CC'
+          xml.tag! :Status, 'A'
+          #TODO Check if credit_card or reference passed in
+          add_customer_creditcard(xml, creditcard, options[:currency])
+        end
+        commit(order)
+      end
+      
+      # NEW
+      def unstore(identification, options = {})
+        parameters = {
+          :billingid => identification,
+        }
+        
+        order = build_profile_request_xml(parameters) do |xml|
+          add_customer_data(xml, options)
+        end
+        commit(order)
+      end
+      
+      # NEW
+      #TODO: Copied from trust_commerce.rb, need to make it Orbital compatible
+      def recurring(money, creditcard = nil, options = {})        
+        requires!(options, [:periodicity, :monthly, :weekly, :yearly] )
+
+        # TODO: Make this CRON format. See orbital xml spec page 164
+        current_time = Time.now
+        
+        cycle = case options[:periodicity]
+        when :monthly
+         '#{current_time.day} * ?'
+        when :weekly
+         '? * #{current_time.wday + 1}'
+        when :yearly
+         '#{current_time.day} #{current_time.month} ?'
+        end
+
+        parameters = {
+         :amount => amount(money),
+         :cycle => cycle,
+         :verify => options[:verify] || 'y',
+         :customer_ref_num => options[:billingid] || options[:billing_id] || nil,
+         :payments => options[:payments] || nil,
+        }
+
+        # TODO Build order xml
+        order = build_profile_request_xml(parameters) do |xml|
+          #TODO Check if credit_card
+          if not credit_card.nil?
+            # add_credit_card if passed it
+          end
+          add_customer_data(xml, options)
+          # add_address
+        end
+
+        commit(order)
+      end
+       
       private                       
             
-      def add_customer_data(xml, options)
-        if options[:customer_ref_num]
-          xml.tag! :CustomerProfileFromOrderInd, 'S'
-          xml.tag! :CustomerRefNum, options[:customer_ref_num]
+      def add_customer_data(xml, customer_ref_num)
+        xml.tag! :CustomerProfileFromOrderInd, 'S'
+        xml.tag! :CustomerRefNum, customer_ref_num
+      end
+      
+      def assign_customer_ref_num(xml, customer_ref_num)
+        add_customer_data(xml, customer_ref_num)
+        xml.tag! :CustomerProfileAction, 'C'
+      end
+      
+      def add_customer_profile(xml, options)
+        if address = options[:billing_address] || options[:address]
+          xml.tag! :CustomerZip, address[:zip]
+          xml.tag! :CustomerAddress1, address[:address1]
+          xml.tag! :CustomerAddress2, address[:address2]
+          xml.tag! :CustomerCity, address[:city]
+          xml.tag! :CustomerState, address[:state]
+          xml.tag! :CustomerPhone, address[:phone] ? address[:phone].scan(/\d/).join.to_s : nil
+          xml.tag! :CustomerName, address[:name]
+          xml.tag! :CustomerCountryCode, address[:country]
+        end
+        xml.tag! :CustomerEmail, options[:email] if options[:email]
+        if options[:order_id]
+          xml.tag! :CustomerProfileOrderOverrideInd, 'NO' # Don't auto-set order_id
         else
-          xml.tag! :CustomerProfileFromOrderInd, 'A'
+          xml.tag! :CustomerProfileOrderOverrideInd, 'OI'
         end
       end
       
@@ -146,7 +236,7 @@ module ActiveMerchant #:nodoc:
         xml.tag! :SDMerchantEmail, soft_desc.merchant_email
       end
 
-      def add_address(xml, creditcard, options)      
+      def add_address(xml, source, options)      
         if address = options[:billing_address] || options[:address]
           xml.tag! :AVSzip, address[:zip]
           xml.tag! :AVSaddress1, address[:address1]
@@ -154,8 +244,12 @@ module ActiveMerchant #:nodoc:
           xml.tag! :AVScity, address[:city]
           xml.tag! :AVSstate, address[:state]
           xml.tag! :AVSphoneNum, address[:phone] ? address[:phone].scan(/\d/).join.to_s : nil
-          xml.tag! :AVSname, creditcard.name
           xml.tag! :AVScountryCode, address[:country]
+          if source.is_a?(String)
+            xml.tag! :AVSname, address[:name]
+          else
+            xml.tag! :AVSname, source.name
+          end
         end
       end
 
@@ -168,6 +262,20 @@ module ActiveMerchant #:nodoc:
         
         xml.tag! :CardSecValInd, 1 if creditcard.verification_value? && %w( visa discover ).include?(creditcard.brand)
         xml.tag! :CardSecVal,  creditcard.verification_value if creditcard.verification_value?
+      end
+      
+      # NEW
+      def add_payment_source(xml, source, currency=nil)
+        if source.is_a?(String)
+          add_customer_data(xml, customer_ref_num)
+        else
+          add_creditcard(xml, source, currency)
+        end
+      end
+      
+      def add_customer_creditcard(xml, creditcard, currency=nil)
+        xml.tag! :CCAccountNum, creditcard.number
+        xml.tag! :CCExpireDate, expiry_date(creditcard)
       end
       
       def add_refund(xml, currency=nil)
@@ -295,6 +403,19 @@ module ActiveMerchant #:nodoc:
         xml.target!
       end
       
+      # NEW
+      def build_profile_request_xml(authorization, parameters = {})
+        xml = xml_envelope
+        xml.tag! :Request do
+          xml.tag! :Profile do
+            add_xml_credentials(xml)
+            add_bin_merchant_and_terminal(xml, parameters)
+            xml.tag! :CustomerRefNum, format_billing_id(parameters[:billingid])
+            yield xml if block_given?
+          end
+        end
+      end
+      
       def currency_code(currency)
         CURRENCY_CODES[(currency || self.default_currency)].to_s
       end
@@ -338,6 +459,12 @@ module ActiveMerchant #:nodoc:
         order_id = order_id.to_s.gsub(/\./, '-')
         order_id.gsub!(illegal_characters, '')
         order_id[0...22]
+      end
+      
+      # NEW
+      # Billing IDs have the same restrictions as order IDs
+      def format_billing_id(billing_id)
+        format_order_id(billing_id)
       end
     end
   end
