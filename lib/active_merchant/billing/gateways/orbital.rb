@@ -90,17 +90,9 @@ module ActiveMerchant #:nodoc:
           add_payment_source(xml, creditcard_or_billing_id, options[:currency])
           add_address(xml, creditcard_or_billing_id, options)
           
-          # if credit card and billing_id pass in create new customer profile
-          if options[:billing_id]
-            assign_customer_ref_num(xml, options[:billing_id])
-          end
+          # if credit card and billing_id passed in create new customer profile
+          assign_customer_ref_num(xml, options[:billing_id]) if options[:billing_id]
         end
-        #   else
-        #     if creditcard_or_billing_id.is_a?(String)
-        #       xml.tag! :CustomerProfileFromOrderInd, "EMPTY" # Set when using the billing_id, not setting it
-        #     end
-        #   end
-        # end
         commit(order)
       end
       
@@ -142,7 +134,7 @@ module ActiveMerchant #:nodoc:
       
       # NEW
       def store(creditcard, options = {})
-        options[:order_id] = options[:billing_id]
+        options[:order_id] = options[:billing_id] unless options[:order_id]
         # Authorizing with amount 0 is the same as verifying the card and creating a profile
         authorize(0, creditcard, options)
       end
@@ -180,7 +172,6 @@ module ActiveMerchant #:nodoc:
         parameters = {
          :amount => amount(money),
          :cycle => cycle,
-         :verify => options[:verify] || 'y',
          :customer_ref_num => options[:billingid] || options[:billing_id] || nil,
          :payments => options[:payments] || nil,
         }
@@ -311,7 +302,6 @@ module ActiveMerchant #:nodoc:
       def commit(order)
         headers = POST_HEADERS.merge("Content-length" => order.size.to_s)
         request = lambda {return parse(ssl_post(remote_url, order, headers))}
-        puts order
         
         # Failover URL will be used in the event of a connection error
         begin response = request.call; rescue ConnectionError; retry end
