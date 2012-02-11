@@ -85,11 +85,22 @@ module ActiveMerchant #:nodoc:
       end
       
       # A – Authorization request
-      def authorize(money, creditcard, options = {})
+      def authorize(money, creditcard_or_billing_id, options = {})
         order = build_new_order_xml('A', money, options) do |xml|
-          add_creditcard(xml, creditcard, options[:currency])        
-          add_address(xml, creditcard, options)   
+          add_payment_source(xml, creditcard_or_billing_id, options[:currency])
+          add_address(xml, creditcard_or_billing_id, options)
+          
+          # if credit card and billing_id pass in create new customer profile
+          if options[:billing_id]
+            assign_customer_ref_num(xml, options[:billing_id])
+          end
         end
+        #   else
+        #     if creditcard_or_billing_id.is_a?(String)
+        #       xml.tag! :CustomerProfileFromOrderInd, "EMPTY" # Set when using the billing_id, not setting it
+        #     end
+        #   end
+        # end
         commit(order)
       end
       
@@ -98,6 +109,8 @@ module ActiveMerchant #:nodoc:
         order = build_new_order_xml('AC', money, options) do |xml|
           add_payment_source(xml, creditcard_or_billing_id, options[:currency])
           add_address(xml, creditcard_or_billing_id, options)
+
+          # For new customers
           assign_customer_ref_num(xml, options[:billing_id]) if options[:billing_id]
         end
         commit(order)
@@ -128,32 +141,21 @@ module ActiveMerchant #:nodoc:
       end
       
       # NEW
-      def store(creditcard, options = {})   
-        parameters = {
-          :verify => options[:verify] || 'y', # USED?
-          :customer_ref_num => options[:billingid] || options[:billing_id] || nil,
-        }
-        
-        # TODO Build order xml
-        order = build_profile_request_xml(parameters) do |xml|
-          xml.tag! :CustomerProfileAction, 'C'
-          add_customer_data(xml, options)
-          xml.tag! :CustomerAccountType, 'CC'
-          xml.tag! :Status, 'A'
-          #TODO Check if credit_card or reference passed in
-          add_customer_creditcard(xml, creditcard, options[:currency])
-        end
-        commit(order)
+      def store(creditcard, options = {})
+        options[:order_id] = options[:billing_id]
+        # Authorizing with amount 0 is the same as verifying the card and creating a profile
+        authorize(0, creditcard, options)
       end
       
       # NEW
-      def unstore(identification, options = {})
+      def unstore(billing_id, options = {})
         parameters = {
-          :billingid => identification,
+          :billingid => billing_id,
         }
         
         order = build_profile_request_xml(parameters) do |xml|
-          add_customer_data(xml, options)
+          xml.tag! :CustomerRefNum, billing_id
+          xml.tag! :CustomerProfileAction, 'D'
         end
         commit(order)
       end
@@ -199,13 +201,13 @@ module ActiveMerchant #:nodoc:
       private                       
             
       def add_customer_data(xml, customer_ref_num)
-        xml.tag! :CustomerProfileFromOrderInd, 'S'
-        xml.tag! :CustomerRefNum, customer_ref_num
+        xml.tag! :CustomerRefNum, format_billing_id(customer_ref_num)
       end
       
-      def assign_customer_ref_num(xml, customer_ref_num)
+      def assign_customer_ref_num(xml, customer_ref_num, options = {})
+        xml.tag! :CustomerProfileFromOrderInd, 'S'
         add_customer_data(xml, customer_ref_num)
-        xml.tag! :CustomerProfileAction, 'C'
+        xml.tag! :CustomerProfileOrderOverrideInd, 'NO'
       end
       
       def add_customer_profile(xml, options)
@@ -219,7 +221,7 @@ module ActiveMerchant #:nodoc:
           xml.tag! :CustomerName, address[:name]
           xml.tag! :CustomerCountryCode, address[:country]
         end
-        xml.tag! :CustomerEmail, options[:email] if options[:email]
+        # xml.tag! :CustomerEmail, options[:email] if options[:email] # Not available for on the fly profile adds
         if options[:order_id]
           xml.tag! :CustomerProfileOrderOverrideInd, 'NO' # Don't auto-set order_id
         else
@@ -239,14 +241,14 @@ module ActiveMerchant #:nodoc:
       def add_address(xml, source, options)      
         if address = options[:billing_address] || options[:address]
           xml.tag! :AVSzip, address[:zip]
-          xml.tag! :AVSaddress1, address[:address1]
-          xml.tag! :AVSaddress2, address[:address2]
-          xml.tag! :AVScity, address[:city]
-          xml.tag! :AVSstate, address[:state]
+          xml.tag! :AVSaddress1, address[:address1] if address[:address1]
+          xml.tag! :AVSaddress2, address[:address2] if address[:address2]
+          xml.tag! :AVScity, address[:city] if address[:city]
+          xml.tag! :AVSstate, address[:state] if address[:state]
           xml.tag! :AVSphoneNum, address[:phone] ? address[:phone].scan(/\d/).join.to_s : nil
-          xml.tag! :AVScountryCode, address[:country]
+          xml.tag! :AVScountryCode, address[:country] if address[:country]
           if source.is_a?(String)
-            xml.tag! :AVSname, address[:name]
+            xml.tag! :AVSname, address[:name] if address[:name]
           else
             xml.tag! :AVSname, source.name
           end
@@ -267,7 +269,7 @@ module ActiveMerchant #:nodoc:
       # NEW
       def add_payment_source(xml, source, currency=nil)
         if source.is_a?(String)
-          add_customer_data(xml, customer_ref_num)
+          add_customer_data(xml, source)
         else
           add_creditcard(xml, source, currency)
         end
@@ -309,6 +311,7 @@ module ActiveMerchant #:nodoc:
       def commit(order)
         headers = POST_HEADERS.merge("Content-length" => order.size.to_s)
         request = lambda {return parse(ssl_post(remote_url, order, headers))}
+        puts order
         
         # Failover URL will be used in the event of a connection error
         begin response = request.call; rescue ConnectionError; retry end
@@ -404,16 +407,16 @@ module ActiveMerchant #:nodoc:
       end
       
       # NEW
-      def build_profile_request_xml(authorization, parameters = {})
+      def build_profile_request_xml(parameters = {})
         xml = xml_envelope
         xml.tag! :Request do
           xml.tag! :Profile do
             add_xml_credentials(xml)
-            add_bin_merchant_and_terminal(xml, parameters)
-            xml.tag! :CustomerRefNum, format_billing_id(parameters[:billingid])
+            add_customer_bin_merchant_and_terminal(xml, parameters)
             yield xml if block_given?
           end
         end
+        xml.target!
       end
       
       def currency_code(currency)
@@ -443,6 +446,12 @@ module ActiveMerchant #:nodoc:
         xml.tag! :BIN, bin
         xml.tag! :MerchantID, @options[:merchant_id]
         xml.tag! :TerminalID, parameters[:terminal_id] || '001'
+      end
+      
+      def add_customer_bin_merchant_and_terminal(xml, parameters)
+        xml.tag! :CustomerBin, bin
+        xml.tag! :CustomerMerchantID, @options[:merchant_id]
+        # xml.tag! :CustomerTerminalID, parameters[:terminal_id] || '001'
       end
 
       def salem_mid?
