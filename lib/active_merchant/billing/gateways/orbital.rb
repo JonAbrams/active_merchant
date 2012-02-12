@@ -1,5 +1,6 @@
 require File.dirname(__FILE__) + '/orbital/orbital_soft_descriptors.rb'
 require "rexml/document"
+require"date"
 
 module ActiveMerchant #:nodoc:
   module Billing #:nodoc:
@@ -153,17 +154,22 @@ module ActiveMerchant #:nodoc:
       
       def recurring(money, creditcard_or_billing_id, options = {})        
         requires!(options, [:periodicity, :monthly, :weekly, :yearly] )
+        requires!(options, :start_date)
 
         # Conform to Orbital's time format
-        current_time = Time.now
+        start_date = Date.new(
+          options[:start_date][4..7].to_i, 
+          options[:start_date][0..1].to_i,
+          options[:start_date][2..3].to_i
+        )
         
         cycle = case options[:periodicity]
         when :monthly
-         "#{current_time.day} * ?"
+         "#{start_date.day} * ?"
         when :weekly
-         "? * #{current_time.wday + 1}"
+         "? * #{start_date.wday + 1}"
         when :yearly
-         "#{current_time.day} #{current_time.month} ?"
+         "#{start_date.day} #{start_date.month} ?"
         end
 
         if creditcard_or_billing_id.is_a?(String)
@@ -179,7 +185,7 @@ module ActiveMerchant #:nodoc:
           :cycle => cycle,
           :customer_ref_num => options[:billingid] || options[:billing_id] || nil,
           :payments => options[:payments] || nil,
-          :start_date => options[:start_date] || nil # MMDDYYYY e.g. 05252012 for May 25, 2012
+          :start_date => options[:start_date] # MMDDYYYY e.g. 05252012 for May 25, 2012
         }
 
         order = build_profile_request_xml(parameters) do |xml|
