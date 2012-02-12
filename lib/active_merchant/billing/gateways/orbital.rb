@@ -132,58 +132,59 @@ module ActiveMerchant #:nodoc:
         commit(order)
       end
       
-      # NEW
+      # To store a credit card just do a $0 authorization with a billing_id
       def store(creditcard, options = {})
-        options[:order_id] = options[:billing_id] unless options[:order_id]
-        # Authorizing with amount 0 is the same as verifying the card and creating a profile
-        authorize(0, creditcard, options)
+        if options[:billing_id]
+          options[:order_id] = options[:billing_id] unless options[:order_id]
+          # Authorizing with amount 0 is the same as verifying the card and creating a profile
+          authorize(0, creditcard, options)
+        end
       end
       
-      # NEW
       def unstore(billing_id, options = {})
         parameters = {
-          :billingid => billing_id,
+          :billing_id => billing_id,
+          :action => 'D'
         }
         
-        order = build_profile_request_xml(parameters) do |xml|
-          xml.tag! :CustomerRefNum, billing_id
-          xml.tag! :CustomerProfileAction, 'D'
-        end
+        order = build_profile_request_xml(parameters)
         commit(order)
       end
       
-      # NEW
-      #TODO: Copied from trust_commerce.rb, need to make it Orbital compatible
-      def recurring(money, creditcard = nil, options = {})        
+      def recurring(money, creditcard_or_billing_id, options = {})        
         requires!(options, [:periodicity, :monthly, :weekly, :yearly] )
 
-        # TODO: Make this CRON format. See orbital xml spec page 164
+        # Conform to Orbital's time format
         current_time = Time.now
         
         cycle = case options[:periodicity]
         when :monthly
-         '#{current_time.day} * ?'
+         "#{current_time.day} * ?"
         when :weekly
-         '? * #{current_time.wday + 1}'
+         "? * #{current_time.wday + 1}"
         when :yearly
-         '#{current_time.day} #{current_time.month} ?'
+         "#{current_time.day} #{current_time.month} ?"
         end
 
+        if creditcard_or_billing_id.is_a?(String)
+          billing_id = creditcard_or_billing_id
+        else
+          billing_id = options[:billing_id]
+        end
+        
         parameters = {
-         :amount => amount(money),
-         :cycle => cycle,
-         :customer_ref_num => options[:billingid] || options[:billing_id] || nil,
-         :payments => options[:payments] || nil,
+          :billing_id => billing_id,
+          :action => 'U',
+          :amount => amount(money),
+          :cycle => cycle,
+          :customer_ref_num => options[:billingid] || options[:billing_id] || nil,
+          :payments => options[:payments] || nil,
+          :start_date => options[:start_date] || nil # MMDDYYYY e.g. 05252012 for May 25, 2012
         }
 
-        # TODO Build order xml
         order = build_profile_request_xml(parameters) do |xml|
-          #TODO Check if credit_card
-          if not credit_card.nil?
-            # add_credit_card if passed it
-          end
-          add_customer_data(xml, options)
-          # add_address
+          # TODO Support credit cards not just customer reference
+          add_recurring(xml, parameters)
         end
 
         commit(order)
@@ -191,6 +192,15 @@ module ActiveMerchant #:nodoc:
        
       private                       
             
+      def add_recurring(xml, options = {})
+        xml.tag! :MBType, 'R'
+        xml.tag! :MBOrderIdGenerationMethod, 'IO'
+        xml.tag! :MBRecurringStartDate, options[:start_date]
+        xml.tag! :MBRecurringNoEndDateFlag, 'Y' unless options[:payments]
+        xml.tag! :MBRecurringMaxBillings, options[:payments] if options[:payments]
+        xml.tag! :MBRecurringFrequency, options[:cycle]
+      end
+      
       def add_customer_data(xml, customer_ref_num)
         xml.tag! :CustomerRefNum, format_billing_id(customer_ref_num)
       end
@@ -199,25 +209,6 @@ module ActiveMerchant #:nodoc:
         xml.tag! :CustomerProfileFromOrderInd, 'S'
         add_customer_data(xml, customer_ref_num)
         xml.tag! :CustomerProfileOrderOverrideInd, 'NO'
-      end
-      
-      def add_customer_profile(xml, options)
-        if address = options[:billing_address] || options[:address]
-          xml.tag! :CustomerZip, address[:zip]
-          xml.tag! :CustomerAddress1, address[:address1]
-          xml.tag! :CustomerAddress2, address[:address2]
-          xml.tag! :CustomerCity, address[:city]
-          xml.tag! :CustomerState, address[:state]
-          xml.tag! :CustomerPhone, address[:phone] ? address[:phone].scan(/\d/).join.to_s : nil
-          xml.tag! :CustomerName, address[:name]
-          xml.tag! :CustomerCountryCode, address[:country]
-        end
-        # xml.tag! :CustomerEmail, options[:email] if options[:email] # Not available for on the fly profile adds
-        if options[:order_id]
-          xml.tag! :CustomerProfileOrderOverrideInd, 'NO' # Don't auto-set order_id
-        else
-          xml.tag! :CustomerProfileOrderOverrideInd, 'OI'
-        end
       end
       
       def add_soft_descriptors(xml, soft_desc)
@@ -257,7 +248,6 @@ module ActiveMerchant #:nodoc:
         xml.tag! :CardSecVal,  creditcard.verification_value if creditcard.verification_value?
       end
       
-      # NEW
       def add_payment_source(xml, source, currency=nil)
         if source.is_a?(String)
           add_customer_data(xml, source)
@@ -396,13 +386,15 @@ module ActiveMerchant #:nodoc:
         xml.target!
       end
       
-      # NEW
       def build_profile_request_xml(parameters = {})
         xml = xml_envelope
         xml.tag! :Request do
           xml.tag! :Profile do
             add_xml_credentials(xml)
             add_customer_bin_merchant_and_terminal(xml, parameters)
+            add_customer_data(xml, parameters[:billing_id])
+            xml.tag! :CustomerProfileAction, parameters[:action]
+            xml.tag! :OrderDefaultAmount, parameters[:amount] if parameters[:amount]
             yield xml if block_given?
           end
         end
@@ -460,7 +452,6 @@ module ActiveMerchant #:nodoc:
         order_id[0...22]
       end
       
-      # NEW
       # Billing IDs have the same restrictions as order IDs
       def format_billing_id(billing_id)
         format_order_id(billing_id)
